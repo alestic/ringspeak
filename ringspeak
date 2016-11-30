@@ -1,0 +1,71 @@
+#!/bin/bash -e
+#
+# ringspeak - Ring a phone number and speak some text
+#
+
+# Configuration
+: ${RINGSPEAK_CONFIG:=$HOME/.ringspeak}
+test -r "$RINGSPEAK_CONFIG" && source $RINGSPEAK_CONFIG
+
+# Command line options
+say=
+at=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --s3-bucket)         RINGSPEAK_S3_BUCKET=$2;  shift 2 ;;
+    --s3-prefix)         RINGSPEAK_S3_PREFIX=$2;  shift 2 ;;
+    --from-phone|--from) RINGSPEAK_FROM_PHONE=$2; shift 2 ;;
+    --to-phone|--to)     RINGSPEAK_TO_PHONE=$2;   shift 2 ;;
+    --voice)             RINGSPEAK_VOICE=$2;      shift 2 ;;
+    --say)               say="$say $2";           shift 2 ;;
+    --at)                at=$2;                   shift 2 ;;
+    -*) echo "$0: Unrecognized option: $1" >&2;   exit 1  ;;
+    *) break ;;
+  esac
+done
+say="$say $@"
+: ${TWILIO_ACCOUNT_SID?} \
+  ${TWILIO_AUTH_TOKEN?} \
+  ${RINGSPEAK_FROM_PHONE?Please specify --from-phone} \
+  ${RINGSPEAK_TO_PHONE?Please specify --to-phone} \
+  ${RINGSPEAK_S3_BUCKET?Please specify --s3-bucket} \
+  ${RINGSPEAK_S3_PREFIX?Please specify --s3-prefix} \
+  ${RINGSPEAK_VOICE:=Salli}
+
+if [ -n "$at" ]; then
+    echo "$0 --s3-bucket '$RINGSPEAK_S3_BUCKET' --s3-prefix '$RINGSPEAK_S3_PREFIX' --from-phone '$RINGSPEAK_FROM_PHONE' --to-phone '$RINGSPEAK_TO_PHONE' --voice '$RINGSPEAK_VOICE' --say '$say'" | at "$at"
+    exit 0
+fi
+
+# Generate voice audio
+
+if [ $RINGSPEAK_VOICE = 'Twilio' ]; then
+    encoded_say=$(python -c "import urllib; print urllib.quote('''$say''')")
+    say_url="http://twimlets.com/message?Message%5B0%5D=$encoded_say"
+else
+    output_format=mp3
+    audio_file=ringspeak-$(date +%Y%m%d-%H%M%S)-$(uuid -v4 -FSIV).$output_format
+    tmp_audio_file=/tmp/$audio_file
+    aws polly synthesize-speech \
+      --output-format "$output_format" \
+      --voice-id "$RINGSPEAK_VOICE" \
+      --text "$say" \
+      $tmp_audio_file
+
+    aws s3 cp --acl public-read \
+      $tmp_audio_file \
+      s3://$RINGSPEAK_S3_BUCKET/$RINGSPEAK$audio_file
+
+    rm $tmp_audio_file
+
+    voice_url=http://s3.amazonaws.com/$RINGSPEAK_S3_BUCKET/$RINGSPEAK$audio_file
+    say_url="http://twimlets.com/message?Message%5B0%5D=$voice_url"
+fi
+
+# Initiate Twilio call
+
+curl -XPOST https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/Calls.json \
+    -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+    --data-urlencode "From=$RINGSPEAK_FROM_PHONE" \
+    --data-urlencode "To=$RINGSPEAK_TO_PHONE" \
+    --data-urlencode "Url=$say_url"
